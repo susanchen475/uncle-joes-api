@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import bigquery
 from pydantic import BaseModel
 from passlib.context import CryptContext
+import bcrypt # for login
 
 PROJECT_ID = "uncle-joes-coffee-club"
 DATASET_ID = "uncle_joes"
@@ -208,35 +209,66 @@ def get_location(location_id: str):
 # -------------------------
 
 @app.post("/login")
-def login(auth: LoginRequest):
-    query = f"""
-        SELECT email, password
-        FROM `{PROJECT_ID}.{DATASET_ID}.members`
+def login(body: LoginRequest):
+    submitted_bytes = body.password.encode("utf-8")
+    
+    # Matches the example's parameterized query style
+    query = """
+        SELECT id, first_name, last_name, email, password
+        FROM `{project}.{dataset}.members`
         WHERE email = @email
-    """
+        LIMIT 1
+    """.format(project=PROJECT_ID, dataset=DATASET_ID)
+
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
-            bigquery.ScalarQueryParameter("email", "STRING", auth.email)
+            bigquery.ScalarQueryParameter("email", "STRING", body.email),
         ]
     )
-    results = run_query(query, job_config)
 
-    if not results or not pwd_context.verify(auth.password, results[0]["password"]):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+    # Use the client directly to match the example pattern
+    results = list(client.query(query, job_config=job_config).result())
 
-    return {"message": "Login successful", "email": auth.email}
+    if not results:
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+    row = results[0]
+    stored_hash: str = row["password"]
+
+    # Verify the submitted password against the bcrypt hash from the DB
+    if not bcrypt.checkpw(submitted_bytes, stored_hash.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+    return {
+        "authenticated": True,
+        "member_id": row["id"],
+        "name": f"{row['first_name']} {row['last_name']}",
+        "email": row["email"],
+        "token": "simple-session-token-123" # Required to show state persistence
+    }
 
 
 @app.get("/members/{member_id}/orders")
 def get_member_orders(member_id: str):
-    query = f"""
-        SELECT o.order_id, o.order_date, o.order_total, i.item_name, i.quantity, i.price
-        FROM `{PROJECT_ID}.{DATASET_ID}.orders` o
-        JOIN `{PROJECT_ID}.{DATASET_ID}.order_items` i
-          ON o.order_id = i.order_id
+    # This 3-table JOIN pulls the city/state and the itemized details in one go
+    query = """
+        SELECT 
+            o.order_id, 
+            o.order_date, 
+            o.order_total, 
+            l.city, 
+            l.state,
+            i.item_name, 
+            i.size, 
+            i.quantity, 
+            i.price
+        FROM `{project}.{dataset}.orders` o
+        JOIN `{project}.{dataset}.locations` l ON o.store_id = l.id
+        JOIN `{project}.{dataset}.order_items` i ON o.order_id = i.order_id
         WHERE o.member_id = @member_id
         ORDER BY o.order_date DESC
-    """
+    """.format(project=PROJECT_ID, dataset=DATASET_ID)
+    
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("member_id", "STRING", member_id)
@@ -247,19 +279,28 @@ def get_member_orders(member_id: str):
 
 @app.get("/members/{member_id}/points")
 def get_member_points(member_id: str):
-    query = f"""
+    query = """
         SELECT SUM(order_total) AS total_spent
-        FROM `{PROJECT_ID}.{DATASET_ID}.orders`
+        FROM `{project}.{dataset}.orders`
         WHERE member_id = @member_id
-    """
+    """.format(project=PROJECT_ID, dataset=DATASET_ID)
+    
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("member_id", "STRING", member_id)
         ]
     )
     results = run_query(query, job_config)
-    points = int(results[0]["total_spent"] or 0)
-    return {"member_id": member_id, "loyalty_points": points}
+    
+    # Logic: Rounding down the total spent to the nearest whole dollar
+    total_spent = results[0]["total_spent"] or 0
+    points = int(total_spent) 
+    
+    return {
+        "member_id": member_id, 
+        "loyalty_points": points,
+        "raw_spend": round(total_spent, 2)
+    }
 
 
 if __name__ == "__main__":
