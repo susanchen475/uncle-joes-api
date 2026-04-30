@@ -1,4 +1,6 @@
 import os
+import uuid
+from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import bigquery
@@ -21,12 +23,25 @@ app.add_middleware(
 client = bigquery.Client(project=PROJECT_ID)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-
+# Models
 class LoginRequest(BaseModel):
     email: str
     password: str
 
+class OrderItem(BaseModel):
+    item_id: str
+    item_name: str
+    size: str
+    quantity: int
+    price: float
 
+class OrderCreate(BaseModel):
+    member_id: str
+    store_id: str
+    order_total: float
+    items: list[OrderItem]
+
+# UTILITY
 def run_query(query: str, job_config=None):
     try:
         query_job = client.query(query, job_config=job_config)
@@ -34,11 +49,98 @@ def run_query(query: str, job_config=None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/")
 def root():
     return {"message": "Uncle Joe's Coffee API is running"}
 
+# -------------------------
+# MEMBER AUTHENTICATION
+# -------------------------
+
+@app.post("/login")
+def login(body: LoginRequest):
+    """
+    Verifies credentials on backend and returns member info[cite: 13, 15, 70].
+    Shared Pilot Password: Coffee123!.
+    """
+    query = f"""
+        SELECT id, first_name, last_name, email, password
+        FROM `{PROJECT_ID}.{DATASET_ID}.members`
+        WHERE email = @email
+        LIMIT 1
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("email", "STRING", body.email)]
+    )
+    results = run_query(query, job_config)
+
+    if not results:
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+    row = results[0]
+    stored_hash = row["password"]
+
+    # Verify submitted password against bcrypt hash in DB 
+    if not bcrypt.checkpw(body.password.encode("utf-8"), stored_hash.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+    return {
+        "authenticated": True,
+        "member_id": row["id"],
+        "name": f"{row['first_name']} {row['last_name']}",
+        "email": row["email"],
+        "token": "simple-session-token-123" # Persists logged-in state [cite: 16]
+    }
+
+@app.post("/logout")
+def logout():
+    """Provides a way for the member to log out """
+    return {"message": "Successfully logged out"}
+
+# -------------------------
+# MEMBER DASHBOARD
+# -------------------------
+
+@app.get("/members/{member_id}/orders")
+def get_member_orders(member_id: str):
+    """Returns past orders with line item details [cite: 31, 32]"""
+    query = f"""
+        SELECT 
+            o.order_id, o.order_date, o.order_total, 
+            l.city, l.state,
+            i.item_name, i.size, i.quantity, i.price
+        FROM `{PROJECT_ID}.{DATASET_ID}.orders` o
+        JOIN `{PROJECT_ID}.{DATASET_ID}.locations` l ON o.store_id = l.id
+        JOIN `{PROJECT_ID}.{DATASET_ID}.order_items` i ON o.order_id = i.order_id
+        WHERE o.member_id = @member_id
+        ORDER BY o.order_date DESC
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("member_id", "STRING", member_id)]
+    )
+    return run_query(query, job_config)
+
+@app.get("/members/{member_id}/points")
+def get_member_points(member_id: str):
+    """Calculates points: 1 per whole dollar spent, rounded down [cite: 33, 34]"""
+    query = f"""
+        SELECT SUM(order_total) AS total_spent
+        FROM `{PROJECT_ID}.{DATASET_ID}.orders`
+        WHERE member_id = @member_id
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("member_id", "STRING", member_id)]
+    )
+    results = run_query(query, job_config)
+    
+    total_spent = results[0]["total_spent"] or 0
+    points = int(total_spent) # Rounds down 
+    
+    return {
+        "member_id": member_id, 
+        "loyalty_points": points,
+        "raw_spend": round(total_spent, 2)
+    }
 
 # -------------------------
 # MENU ENDPOINTS
@@ -280,106 +382,6 @@ def get_location_expanded(location_id: str):
             "Sunday": f"{format_time(loc['hours_sunday_open'])} - {format_time(loc['hours_sunday_close'])}"
         }
     }
-
-
-# -------------------------
-# MEMBER ENDPOINTS
-# -------------------------
-
-@app.post("/login")
-def login(body: LoginRequest):
-    submitted_bytes = body.password.encode("utf-8")
-    
-    # Matches the example's parameterized query style
-    query = """
-        SELECT id, first_name, last_name, email, password
-        FROM `{project}.{dataset}.members`
-        WHERE email = @email
-        LIMIT 1
-    """.format(project=PROJECT_ID, dataset=DATASET_ID)
-
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("email", "STRING", body.email),
-        ]
-    )
-
-    # Use the client directly to match the example pattern
-    results = list(client.query(query, job_config=job_config).result())
-
-    if not results:
-        raise HTTPException(status_code=401, detail="Invalid email or password.")
-
-    row = results[0]
-    stored_hash: str = row["password"]
-
-    # Verify the submitted password against the bcrypt hash from the DB
-    if not bcrypt.checkpw(submitted_bytes, stored_hash.encode("utf-8")):
-        raise HTTPException(status_code=401, detail="Invalid email or password.")
-
-    return {
-        "authenticated": True,
-        "member_id": row["id"],
-        "name": f"{row['first_name']} {row['last_name']}",
-        "email": row["email"],
-        "token": "simple-session-token-123" # Required to show state persistence
-    }
-
-
-@app.get("/members/{member_id}/orders")
-def get_member_orders(member_id: str):
-    # This 3-table JOIN pulls the city/state and the itemized details in one go
-    query = """
-        SELECT 
-            o.order_id, 
-            o.order_date, 
-            o.order_total, 
-            l.city, 
-            l.state,
-            i.item_name, 
-            i.size, 
-            i.quantity, 
-            i.price
-        FROM `{project}.{dataset}.orders` o
-        JOIN `{project}.{dataset}.locations` l ON o.store_id = l.id
-        JOIN `{project}.{dataset}.order_items` i ON o.order_id = i.order_id
-        WHERE o.member_id = @member_id
-        ORDER BY o.order_date DESC
-    """.format(project=PROJECT_ID, dataset=DATASET_ID)
-    
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("member_id", "STRING", member_id)
-        ]
-    )
-    return run_query(query, job_config)
-
-
-@app.get("/members/{member_id}/points")
-def get_member_points(member_id: str):
-    query = """
-        SELECT SUM(order_total) AS total_spent
-        FROM `{project}.{dataset}.orders`
-        WHERE member_id = @member_id
-    """.format(project=PROJECT_ID, dataset=DATASET_ID)
-    
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("member_id", "STRING", member_id)
-        ]
-    )
-    results = run_query(query, job_config)
-    
-    # Logic: Rounding down the total spent to the nearest whole dollar
-    total_spent = results[0]["total_spent"] or 0
-    points = int(total_spent) 
-    
-    return {
-        "member_id": member_id, 
-        "loyalty_points": points,
-        "raw_spend": round(total_spent, 2)
-    }
-
 
 if __name__ == "__main__":
     import uvicorn
