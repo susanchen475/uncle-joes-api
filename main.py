@@ -83,7 +83,7 @@ def get_menu_by_category(category: str):
     return results
 
 
-@app.get("/menu/search")
+@app.get("/menu/search/name")
 def search_menu(item_name: str):
     query = f"""
         SELECT *
@@ -100,6 +100,39 @@ def search_menu(item_name: str):
     if not results:
         raise HTTPException(status_code=404, detail="No matching menu items found")
     return results
+
+
+@app.get("/menu/search/keyword")
+def search_menu_keyword(q: str):
+    # This searches both the name AND category for the keyword
+    query = f"""
+        SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.menu_items` 
+        WHERE LOWER(name) LIKE @q 
+           OR LOWER(category) LIKE @q
+        ORDER BY category, name
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("q", "STRING", f"%{q.lower()}%")]
+    )
+    return run_query(query, job_config)
+
+
+
+@app.get("/menu/grouped")
+def get_menu_grouped():
+    # Fetch all items first
+    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.menu_items` ORDER BY category, name"
+    raw_items = run_query(query)
+    
+    # Organize them into a dictionary: { "CategoryName": [items...] }
+    grouped_menu = {}
+    for item in raw_items:
+        cat = item['category']
+        if cat not in grouped_menu:
+            grouped_menu[cat] = []
+        grouped_menu[cat].append(item)
+    
+    return grouped_menu
 
 
 @app.get("/menu/{item_id}")
@@ -202,6 +235,51 @@ def get_location(location_id: str):
     if not results:
         raise HTTPException(status_code=404, detail="Location not found")
     return results[0]
+
+
+@app.get("/locations/{location_id}/details")
+def get_location_expanded(location_id: str):
+    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.locations` WHERE id = @id"
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("id", "STRING", location_id)]
+    )
+    results = run_query(query, job_config)
+    
+    if not results:
+        raise HTTPException(status_code=404, detail="Location not found")
+    
+    loc = results[0]
+
+    # Helper function to turn '800' into '8:00 AM'
+    def format_time(t):
+        if t is None: return "Closed"
+        suffix = "AM" if t < 1200 else "PM"
+        hour = (t // 100)
+        if hour > 12: hour -= 12
+        if hour == 0: hour = 12
+        return f"{hour}:{str(t % 100).zfill(2)} {suffix}"
+
+    return {
+        "basic_info": {
+            "name": f"Uncle Joe's {loc['city']}",
+            "address": f"{loc['address_one']}, {loc['city']}, {loc['state']}",
+            "phone": loc['phone_number']
+        },
+        "amenities": {
+            "has_wifi": loc['wifi'],
+            "has_drive_thru": loc['drive_thru'],
+            "delivery_available": loc['door_dash']
+        },
+        "formatted_hours": {
+            "Monday": f"{format_time(loc['hours_monday_open'])} - {format_time(loc['hours_monday_close'])}",
+            "Tuesday": f"{format_time(loc['hours_tuesday_open'])} - {format_time(loc['hours_tuesday_close'])}",
+            "Wednesday": f"{format_time(loc['hours_wednesday_open'])} - {format_time(loc['hours_wednesday_close'])}",
+            "Thursday": f"{format_time(loc['hours_thursday_open'])} - {format_time(loc['hours_thursday_close'])}",
+            "Friday": f"{format_time(loc['hours_friday_open'])} - {format_time(loc['hours_friday_close'])}",
+            "Saturday": f"{format_time(loc['hours_saturday_open'])} - {format_time(loc['hours_saturday_close'])}",
+            "Sunday": f"{format_time(loc['hours_sunday_open'])} - {format_time(loc['hours_sunday_close'])}"
+        }
+    }
 
 
 # -------------------------
