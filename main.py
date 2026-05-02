@@ -146,62 +146,25 @@ def get_member_points(member_id: str):
 # MENU ENDPOINTS
 # -------------------------
 
-@app.get("/menu")
-def get_menu():
-    query = f"""
-        SELECT *
-        FROM `{PROJECT_ID}.{DATASET_ID}.menu_items`
-        ORDER BY category, name
+@app.get("/menu/grouped")
+def get_menu_grouped():
     """
-    return run_query(query)
-
-
-@app.get("/menu/categories")
-def get_menu_categories():
-    query = f"""
-        SELECT DISTINCT category
-        FROM `{PROJECT_ID}.{DATASET_ID}.menu_items`
-        ORDER BY category
+    The 'Primary' endpoint. Use this to build the main menu 
+    because it provides the structure { "Category": [items...] } in one call.
     """
-    return run_query(query)
-
-
-@app.get("/menu/category/{category}")
-def get_menu_by_category(category: str):
-    query = f"""
-        SELECT *
-        FROM `{PROJECT_ID}.{DATASET_ID}.menu_items`
-        WHERE LOWER(category) = LOWER(@category)
-        ORDER BY name
-    """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("category", "STRING", category)
-        ]
-    )
-    results = run_query(query, job_config)
-    if not results:
-        raise HTTPException(status_code=404, detail="No menu items found for this category")
-    return results
-
-
-@app.get("/menu/search/name")
-def search_menu(item_name: str):
-    query = f"""
-        SELECT *
-        FROM `{PROJECT_ID}.{DATASET_ID}.menu_items`
-        WHERE LOWER(TRIM(name)) LIKE @name
-        ORDER BY category, name
-    """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("name", "STRING", f"%{item_name.lower()}%")
-        ]
-    )
-    results = run_query(query, job_config)
-    if not results:
-        raise HTTPException(status_code=404, detail="No matching menu items found")
-    return results
+    # Fetch all items first
+    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.menu_items` ORDER BY category, name"
+    raw_items = run_query(query)
+    
+    # Organize them into a dictionary: { "CategoryName": [items...] }
+    grouped_menu = {}
+    for item in raw_items:
+        cat = item['category']
+        if cat not in grouped_menu:
+            grouped_menu[cat] = []
+        grouped_menu[cat].append(item)
+    
+    return grouped_menu
 
 
 @app.get("/menu/search/keyword")
@@ -217,24 +180,6 @@ def search_menu_keyword(q: str):
         query_parameters=[bigquery.ScalarQueryParameter("q", "STRING", f"%{q.lower()}%")]
     )
     return run_query(query, job_config)
-
-
-
-@app.get("/menu/grouped")
-def get_menu_grouped():
-    # Fetch all items first
-    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.menu_items` ORDER BY category, name"
-    raw_items = run_query(query)
-    
-    # Organize them into a dictionary: { "CategoryName": [items...] }
-    grouped_menu = {}
-    for item in raw_items:
-        cat = item['category']
-        if cat not in grouped_menu:
-            grouped_menu[cat] = []
-        grouped_menu[cat].append(item)
-    
-    return grouped_menu
 
 
 @app.get("/menu/{item_id}")
@@ -259,17 +204,6 @@ def get_menu_item(item_id: str):
 # LOCATION ENDPOINTS
 # -------------------------
 
-@app.get("/locations")
-def get_locations():
-    query = f"""
-        SELECT *
-        FROM `{PROJECT_ID}.{DATASET_ID}.locations`
-        WHERE open_for_business = TRUE
-        ORDER BY state, city
-    """
-    return run_query(query)
-
-
 @app.get("/locations/states")
 def get_location_states():
     query = f"""
@@ -281,66 +215,84 @@ def get_location_states():
     return run_query(query)
 
 
-@app.get("/locations/filter/{state}")
-def get_locations_by_state(state: str):
+@app.get("/locations/filter/state/{state}")
+def filter_locations_by_state(state: str):
+    """
+    Refined: Returns a clean list of stores in a state with 
+    clear amenity flags (WiFi, Drive-Thru, Delivery).
+    """
     query = f"""
-        SELECT *
-        FROM `{PROJECT_ID}.{DATASET_ID}.locations`
-        WHERE UPPER(state) = UPPER(@state)
+        SELECT 
+            id, city, state, address_one, zip_code,
+            wifi, drive_thru, door_dash
+        FROM `{PROJECT_ID}.{DATASET_ID}.locations` 
+        WHERE UPPER(state) = UPPER(@state) 
           AND open_for_business = TRUE
-        ORDER BY city, address_one
+        ORDER BY city
     """
     job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("state", "STRING", state.upper())
-        ]
+        query_parameters=[bigquery.ScalarQueryParameter("state", "STRING", state.upper())]
     )
     results = run_query(query, job_config)
-    if not results:
-        raise HTTPException(status_code=404, detail="No locations found for this state")
-    return results
+    
+    # We map the results to clear labels for the frontend
+    return [
+        {
+            "id": loc["id"],
+            "city": loc["city"],
+            "address": f"{loc['address_one']}, {loc['city']}, {loc['state']} {loc['zip_code']}",
+            "services": {
+                "free_wifi": loc["wifi"],
+                "drive_thru": loc["drive_thru"],
+                "doordash_available": loc["door_dash"]
+            }
+        } for loc in results
+    ]
 
 
-@app.get("/locations/city/{city}")
+@app.get("/locations/filter/city/{city}")
 def get_locations_by_city(city: str):
+    """
+    Refined: Now matches the 'State' filter format so the frontend 
+    can use the same code to display search results.
+    """
     query = f"""
-        SELECT *
-        FROM `{PROJECT_ID}.{DATASET_ID}.locations`
-        WHERE LOWER(city) = LOWER(@city)
+        SELECT 
+            id, city, state, address_one, zip_code,
+            wifi, drive_thru, door_dash
+        FROM `{PROJECT_ID}.{DATASET_ID}.locations` 
+        WHERE LOWER(city) = LOWER(@city) 
           AND open_for_business = TRUE
         ORDER BY address_one
     """
     job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("city", "STRING", city)
-        ]
+        query_parameters=[bigquery.ScalarQueryParameter("city", "STRING", city.lower())]
     )
     results = run_query(query, job_config)
+    
     if not results:
         raise HTTPException(status_code=404, detail="No locations found for this city")
-    return results
+
+    return [
+        {
+            "id": loc["id"],
+            "city": loc["city"],
+            "address": f"{loc['address_one']}, {loc['city']}, {loc['state']} {loc['zip_code']}",
+            "services": {
+                "free_wifi": loc["wifi"],
+                "drive_thru": loc["drive_thru"],
+                "doordash_available": loc["door_dash"]
+            }
+        } for loc in results
+    ]
 
 
 @app.get("/locations/{location_id}")
-def get_location(location_id: str):
-    query = f"""
-        SELECT *
-        FROM `{PROJECT_ID}.{DATASET_ID}.locations`
-        WHERE id = @id
+def get_location_details(location_id: str):
     """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("id", "STRING", location_id)
-        ]
-    )
-    results = run_query(query, job_config)
-    if not results:
-        raise HTTPException(status_code=404, detail="Location not found")
-    return results[0]
-
-
-@app.get("/locations/{location_id}/details")
-def get_location_expanded(location_id: str):
+    Refined: Provides store identity, amenities, and human-readable 
+    hours. Excludes latitude/longitude.
+    """
     query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.locations` WHERE id = @id"
     job_config = bigquery.QueryJobConfig(
         query_parameters=[bigquery.ScalarQueryParameter("id", "STRING", location_id)]
@@ -351,28 +303,19 @@ def get_location_expanded(location_id: str):
         raise HTTPException(status_code=404, detail="Location not found")
     
     loc = results[0]
-
-    # Helper function to turn '800' into '8:00 AM'
-    def format_time(t):
-        if t is None: return "Closed"
-        suffix = "AM" if t < 1200 else "PM"
-        hour = (t // 100)
-        if hour > 12: hour -= 12
-        if hour == 0: hour = 12
-        return f"{hour}:{str(t % 100).zfill(2)} {suffix}"
-
     return {
-        "basic_info": {
-            "name": f"Uncle Joe's {loc['city']}",
-            "address": f"{loc['address_one']}, {loc['city']}, {loc['state']}",
-            "phone": loc['phone_number']
+        "store_info": {
+            "name": f"Uncle Joe's Coffee - {loc['city']}",
+            "address": f"{loc['address_one']}, {loc['city']}, {loc['state']} {loc['zip_code']}",
+            "phone": loc['phone_number'],
+            "email": loc['email']
         },
         "amenities": {
-            "has_wifi": loc['wifi'],
-            "has_drive_thru": loc['drive_thru'],
-            "delivery_available": loc['door_dash']
+            "wifi_available": loc['wifi'],
+            "drive_thru_lane": loc['drive_thru'],
+            "doordash_partner": loc['door_dash']
         },
-        "formatted_hours": {
+        "operating_hours": {
             "Monday": f"{format_time(loc['hours_monday_open'])} - {format_time(loc['hours_monday_close'])}",
             "Tuesday": f"{format_time(loc['hours_tuesday_open'])} - {format_time(loc['hours_tuesday_close'])}",
             "Wednesday": f"{format_time(loc['hours_wednesday_open'])} - {format_time(loc['hours_wednesday_close'])}",
@@ -382,6 +325,7 @@ def get_location_expanded(location_id: str):
             "Sunday": f"{format_time(loc['hours_sunday_open'])} - {format_time(loc['hours_sunday_close'])}"
         }
     }
+
 
 if __name__ == "__main__":
     import uvicorn
