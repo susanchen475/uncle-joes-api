@@ -131,11 +131,11 @@ def logout():
 
 @app.get("/members/{member_id}/orders")
 def get_member_orders(member_id: str):
-    """Returns past orders with line item details [cite: 31, 32]"""
+    """Returns order history with line item details [cite: 31, 32, 70]"""
     query = f"""
-        SELECT 
-            o.order_id, o.order_date, o.order_total, 
-            l.city, l.state,
+        SELECT
+            o.order_id, o.order_date, o.order_total,
+            l.store_name, l.city, l.state,
             i.item_name, i.size, i.quantity, i.price
         FROM `{PROJECT_ID}.{DATASET_ID}.orders` o
         JOIN `{PROJECT_ID}.{DATASET_ID}.locations` l ON o.store_id = l.id
@@ -146,7 +146,34 @@ def get_member_orders(member_id: str):
     job_config = bigquery.QueryJobConfig(
         query_parameters=[bigquery.ScalarQueryParameter("member_id", "STRING", member_id)]
     )
-    return run_query(query, job_config)
+    results = run_query(query, job_config)
+
+    # Group flat rows into a nested structure: one object per order containing a list of items
+    orders = []
+    order_indices = {}  # Map order_id to its position in the orders list to preserve sorting
+
+    for row in results:
+        order_id = row["order_id"]
+        if order_id not in order_indices:
+            order_indices[order_id] = len(orders)
+            orders.append({
+                "order_id": order_id,
+                "order_date": row["order_date"],
+                "order_total": row["order_total"],
+                "store_name": row["store_name"],
+                "location": f"{row['city']}, {row['state']}",
+                "items": []
+            })
+       
+        orders[order_indices[order_id]]["items"].append({
+            "item_name": row["item_name"],
+            "size": row["size"],
+            "quantity": row["quantity"],
+            "price": row["price"]
+        })
+
+    return orders
+
 
 @app.get("/members/{member_id}/points")
 def get_member_points(member_id: str):
