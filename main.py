@@ -49,6 +49,34 @@ def run_query(query: str, job_config=None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+def format_time(t):
+    """
+    Utility: Converts BigQuery time integers (e.g., 800, 2230) 
+    into human-readable strings (8:00 AM, 10:30 PM).
+    """
+    if t is None or t == "": 
+        return "Closed"
+    
+    try:
+        t_int = int(t)
+        suffix = "AM" if t_int < 1200 else "PM"
+        
+        # Get hours and minutes
+        hour = (t_int // 100)
+        minutes = t_int % 100
+        
+        # Convert 24h to 12h format
+        if hour > 12: 
+            hour -= 12
+        if hour == 0: 
+            hour = 12
+            
+        return f"{hour}:{str(minutes).zfill(2)} {suffix}"
+    except (ValueError, TypeError):
+        return "Closed"
+
+        
 @app.get("/")
 def root():
     return {"message": "Uncle Joe's Coffee API is running"}
