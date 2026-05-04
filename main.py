@@ -459,6 +459,32 @@ def get_location_details(location_id: str):
     }
 
 
+@app.get("/locations/map")
+def get_locations_for_map():
+    """Fetches store coordinates for map integration."""
+    # We use 'city' as 'store_name' since there is no name column
+    query = f"""
+        SELECT 
+            id,
+            city AS store_name,
+            location_map_lat AS lat,
+            location_map_lng AS lng,
+            address_one,
+            city,
+            state
+        FROM `{PROJECT_ID}.{DATASET_ID}.locations`
+        WHERE open_for_business = TRUE
+    """
+    results = run_query(query)
+    
+    # BigQuery sometimes returns decimals as strings; 
+    # we ensure they are floats so the map doesn't crash.
+    for row in results:
+        row['lat'] = float(row['lat']) if row['lat'] else 0.0
+        row['lng'] = float(row['lng']) if row['lng'] else 0.0
+        
+    return results
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
