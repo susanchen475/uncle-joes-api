@@ -59,11 +59,6 @@ def root():
 
 @app.post("/login")
 def login(body: LoginRequest):
-    """
-    Authenticates a member by email and password[cite: 70].
-    Verifies the bcrypt hash against the members table[cite: 15].
-    Pilot Password Requirement: Coffee123![cite: 10].
-    """
     query = f"""
         SELECT id, first_name, last_name, email, password, home_store
         FROM `{PROJECT_ID}.{DATASET_ID}.members`
@@ -80,7 +75,6 @@ def login(body: LoginRequest):
 
     row = results[0]
    
-    # Password verification must happen on the backend [cite: 24]
     if not bcrypt.checkpw(body.password.encode("utf-8"), row["password"].encode("utf-8")):
         raise HTTPException(status_code=401, detail="Invalid password.")
 
@@ -89,14 +83,12 @@ def login(body: LoginRequest):
         "member_id": row["id"],
         "name": f"{row['first_name']} {row['last_name']}",
         "email": row["email"],
-        # FIX: Ensure it correctly uses row["home_store"], since the DB column is home_store
-        "home_store_id": row["home_store"],
-        "token": "simple-session-token-123" # Persists logged-in state
+        "home_store_id": row["home_store"], # FIXED: Use home_store to match SQL
+        "token": "simple-session-token-123"
     }
 
 @app.post("/logout")
 def logout():
-    """Provides a way for the member to log out [cite: 19]"""
     return {"message": "Successfully logged out"}
 
 # -------------------------
@@ -105,10 +97,9 @@ def logout():
 
 @app.get("/members/{member_id}/profile")
 def get_member_profile(member_id: str):
-    """Returns profile info: name, email, phone, and home store [cite: 58, 62]"""
-    # FIX: Join on m.home_store instead of m.home_store_id
+    # FIXED: phone column removed, address_one mapped to home_store_name, using m.home_store directly
     query = f"""
-        SELECT m.first_name, m.last_name, m.email, m.phone, l.store_name as home_store_name
+        SELECT m.first_name, m.last_name, m.email, l.address_one as home_store_name
         FROM `{PROJECT_ID}.{DATASET_ID}.members` m
         LEFT JOIN `{PROJECT_ID}.{DATASET_ID}.locations` l ON m.home_store = l.id
         WHERE m.id = @id
@@ -123,11 +114,11 @@ def get_member_profile(member_id: str):
 
 @app.get("/members/{member_id}/orders")
 def get_member_orders(member_id: str):
-    """Returns order history with line item details [cite: 31, 32, 70]"""
+    # FIXED: store_name replaced with address_one as store_name
     query = f"""
         SELECT
             o.order_id, o.order_date, o.order_total,
-            l.store_name, l.city, l.state,
+            l.address_one as store_name, l.city, l.state,
             i.item_name, i.size, i.quantity, i.price
         FROM `{PROJECT_ID}.{DATASET_ID}.orders` o
         JOIN `{PROJECT_ID}.{DATASET_ID}.locations` l ON o.store_id = l.id
@@ -140,9 +131,8 @@ def get_member_orders(member_id: str):
     )
     results = run_query(query, job_config)
 
-    # Group flat rows into a nested structure: one object per order containing a list of items
     orders = []
-    order_indices = {}  # Map order_id to its position in the orders list to preserve sorting
+    order_indices = {}
 
     for row in results:
         order_id = row["order_id"]
@@ -162,6 +152,7 @@ def get_member_orders(member_id: str):
                 "item_name": row["item_name"],
                 "size": row["size"],
                 "quantity": row["quantity"],
+                "price": row["price"], # FIXED: Supply frontend with "price" mapping
                 "price_per_item": row["price"]
             })
 
@@ -169,10 +160,6 @@ def get_member_orders(member_id: str):
 
 @app.get("/members/{member_id}/points")
 def get_member_points(member_id: str):
-    """
-    Calculates points: 1 per whole dollar, rounded down[cite: 34, 70].
-    Returns a breakdown of points earned per order[cite: 64].
-    """
     query = f"""
         SELECT order_id, order_date, order_total, CAST(FLOOR(order_total) AS INT64) as points_earned
         FROM `{PROJECT_ID}.{DATASET_ID}.orders`
@@ -184,7 +171,8 @@ def get_member_points(member_id: str):
     )
     history = run_query(query, job_config)
    
-    total_points = sum(item['points_earned'] for item in history)
+    # Safely sum in case points_earned is None
+    total_points = sum(item['points_earned'] for item in history if item['points_earned'])
    
     return {
         "total_points": total_points,
@@ -197,13 +185,11 @@ def get_member_points(member_id: str):
 
 @app.get("/menu")
 def get_menu():
-    """Browse menu by category or search [cite: 42, 44]"""
     query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.menu_items` ORDER BY category, name"
     return run_query(query)
 
 @app.get("/menu/{item_id}")
 def get_menu_item(item_id: str):
-    """Detailed view for a single menu item [cite: 46]"""
     query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.menu_items` WHERE id = @item_id"
     job_config = bigquery.QueryJobConfig(
         query_parameters=[bigquery.ScalarQueryParameter("item_id", "STRING", item_id)]
@@ -215,18 +201,14 @@ def get_menu_item(item_id: str):
 
 @app.post("/orders")
 def place_order(order: OrderCreate):
-    """Allows logged-in members to submit a new order (pay-at-store model) [cite: 48]"""
     order_id = str(uuid.uuid4())
     order_date = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
-    # 1. Insert order header
     order_query = f"""
         INSERT INTO `{PROJECT_ID}.{DATASET_ID}.orders` (order_id, member_id, store_id, order_date, order_total)
         VALUES (@oid, @mid, @sid, @odate, @ototal)
     """
    
-    # 2. Insert line items
-    # We build a bulk insert for the items
     item_placeholders = []
     item_params = [
         bigquery.ScalarQueryParameter("oid", "STRING", order_id),
@@ -262,9 +244,9 @@ def place_order(order: OrderCreate):
 
 @app.get("/orders/{order_id}/confirmation")
 def get_order_confirmation(order_id: str):
-    """Returns a summary for the order confirmation screen [cite: 49]"""
+    # FIXED: store_name mapped to address_one
     query = f"""
-        SELECT o.order_id, o.order_total, l.store_name, l.address_one, l.city
+        SELECT o.order_id, o.order_total, l.address_one as store_name, l.city
         FROM `{PROJECT_ID}.{DATASET_ID}.orders` o
         JOIN `{PROJECT_ID}.{DATASET_ID}.locations` l ON o.store_id = l.id
         WHERE o.order_id = @oid
@@ -283,16 +265,11 @@ def get_order_confirmation(order_id: str):
 
 @app.get("/locations")
 def get_locations():
-    """
-    Returns locations with amenities and map coordinates[cite: 52, 54].
-    Includes latitude and longitude for Map Integration[cite: 53].
-    """
     query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.locations` WHERE open_for_business = TRUE ORDER BY state, city"
     return run_query(query)
 
 @app.get("/locations/search")
 def search_locations(query_str: str):
-    """Filter or search locations by city or state [cite: 51]"""
     query = f"""
         SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.locations`
         WHERE (LOWER(city) LIKE @q OR LOWER(state) LIKE @q)
