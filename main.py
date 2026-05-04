@@ -119,26 +119,15 @@ def logout():
 
 @app.get("/members/{member_id}/orders")
 def get_member_orders(member_id: str):
-<<<<<<< HEAD
-    """Returns order history with line item details [cite: 31, 32, 70]"""
+    """
+    Returns order history with line item details.
+    Uses city alias for store_name since name is missing in schema.
+    """
     query = f"""
         SELECT
             o.order_id, o.order_date, o.order_total,
-            l.store_name, l.city, l.state,
+            l.city AS store_name, l.city, l.state,            
             i.item_name, i.size, i.quantity, i.price
-=======
-    query = f"""
-        SELECT
-            o.order_id,
-            o.order_date,
-            o.order_total,
-            l.city,
-            l.state,
-            i.item_name,
-            i.size,
-            i.quantity,
-            i.price
->>>>>>> 8ecbcca381354fa6a38a034a50a946af3778d8e6
         FROM `{PROJECT_ID}.{DATASET_ID}.orders` o
         JOIN `{PROJECT_ID}.{DATASET_ID}.locations` l
             ON o.store_id = l.id
@@ -154,9 +143,9 @@ def get_member_orders(member_id: str):
     )
     results = run_query(query, job_config)
 
-    # Group flat rows into a nested structure: one object per order containing a list of items
+    # Group flat rows into a nested structure
     orders = []
-    order_indices = {}  # Map order_id to its position in the orders list to preserve sorting
+    order_indices = {}
 
     for row in results:
         order_id = row["order_id"]
@@ -170,7 +159,7 @@ def get_member_orders(member_id: str):
                 "location": f"{row['city']}, {row['state']}",
                 "items": []
             })
-       
+        
         orders[order_indices[order_id]]["items"].append({
             "item_name": row["item_name"],
             "size": row["size"],
@@ -179,7 +168,6 @@ def get_member_orders(member_id: str):
         })
 
     return orders
-
 
 
 @app.get("/members/{member_id}/points")
@@ -209,6 +197,11 @@ def get_member_points(member_id: str):
 # -------------------------
 # MENU ENDPOINTS
 # -------------------------
+
+@app.get("/menu")
+def get_menu():
+    """The 'Master' endpoint most frontends look for. Returns a flat list."""
+    return run_query(f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.menu_items` ORDER BY category, item_name")
 
 @app.get("/menu")
 def get_menu():
