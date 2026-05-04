@@ -49,34 +49,6 @@ def run_query(query: str, job_config=None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-def format_time(t):
-    """
-    Utility: Converts BigQuery time integers (e.g., 800, 2230) 
-    into human-readable strings (8:00 AM, 10:30 PM).
-    """
-    if t is None or t == "": 
-        return "Closed"
-    
-    try:
-        t_int = int(t)
-        suffix = "AM" if t_int < 1200 else "PM"
-        
-        # Get hours and minutes
-        hour = (t_int // 100)
-        minutes = t_int % 100
-        
-        # Convert 24h to 12h format
-        if hour > 12: 
-            hour -= 12
-        if hour == 0: 
-            hour = 12
-            
-        return f"{hour}:{str(minutes).zfill(2)} {suffix}"
-    except (ValueError, TypeError):
-        return "Closed"
-
-        
 @app.get("/")
 def root():
     return {"message": "Uncle Joe's Coffee API is running"}
@@ -88,11 +60,12 @@ def root():
 @app.post("/login")
 def login(body: LoginRequest):
     """
-    Verifies credentials on backend and returns member info[cite: 13, 15, 70].
-    Shared Pilot Password: Coffee123!.
+    Authenticates a member by email and password[cite: 70].
+    Verifies the bcrypt hash against the members table[cite: 15].
+    Pilot Password Requirement: Coffee123![cite: 10].
     """
     query = f"""
-        SELECT id, first_name, last_name, email, password
+        SELECT id, first_name, last_name, email, password, home_store_id
         FROM `{PROJECT_ID}.{DATASET_ID}.members`
         WHERE email = @email
         LIMIT 1
@@ -103,31 +76,48 @@ def login(body: LoginRequest):
     results = run_query(query, job_config)
 
     if not results:
-        raise HTTPException(status_code=401, detail="Invalid email or password.")
+        raise HTTPException(status_code=401, detail="Account not found.")
 
     row = results[0]
-    stored_hash = row["password"]
-
-    # Verify submitted password against bcrypt hash in DB 
-    if not bcrypt.checkpw(body.password.encode("utf-8"), stored_hash.encode("utf-8")):
-        raise HTTPException(status_code=401, detail="Invalid email or password.")
+   
+    # Password verification must happen on the backend [cite: 24]
+    if not bcrypt.checkpw(body.password.encode("utf-8"), row["password"].encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Invalid password.")
 
     return {
         "authenticated": True,
         "member_id": row["id"],
         "name": f"{row['first_name']} {row['last_name']}",
         "email": row["email"],
-        "token": "simple-session-token-123" # Persists logged-in state [cite: 16]
+        "home_store_id": row["home_store_id"], # Supports home store highlight [cite: 63]
+        "token": "simple-session-token-123" # Persists logged-in state
     }
 
 @app.post("/logout")
 def logout():
-    """Provides a way for the member to log out """
+    """Provides a way for the member to log out [cite: 19]"""
     return {"message": "Successfully logged out"}
 
 # -------------------------
-# MEMBER DASHBOARD
+# MEMBER DASHBOARD & PROFILE
 # -------------------------
+
+@app.get("/members/{member_id}/profile")
+def get_member_profile(member_id: str):
+    """Returns profile info: name, email, phone, and home store [cite: 58, 62]"""
+    query = f"""
+        SELECT m.first_name, m.last_name, m.email, m.phone, l.store_name as home_store_name
+        FROM `{PROJECT_ID}.{DATASET_ID}.members` m
+        LEFT JOIN `{PROJECT_ID}.{DATASET_ID}.locations` l ON m.home_store_id = l.id
+        WHERE m.id = @id
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("id", "STRING", member_id)]
+    )
+    results = run_query(query, job_config)
+    if not results:
+        raise HTTPException(status_code=404, detail="Member not found")
+    return results[0]
 
 @app.get("/members/{member_id}/orders")
 def get_member_orders(member_id: str):
@@ -139,7 +129,7 @@ def get_member_orders(member_id: str):
             i.item_name, i.size, i.quantity, i.price
         FROM `{PROJECT_ID}.{DATASET_ID}.orders` o
         JOIN `{PROJECT_ID}.{DATASET_ID}.locations` l ON o.store_id = l.id
-        JOIN `{PROJECT_ID}.{DATASET_ID}.order_items` i ON o.order_id = i.order_id
+        LEFT JOIN `{PROJECT_ID}.{DATASET_ID}.order_items` i ON o.order_id = i.order_id
         WHERE o.member_id = @member_id
         ORDER BY o.order_date DESC
     """
@@ -165,222 +155,151 @@ def get_member_orders(member_id: str):
                 "items": []
             })
        
-        orders[order_indices[order_id]]["items"].append({
-            "item_name": row["item_name"],
-            "size": row["size"],
-            "quantity": row["quantity"],
-            "price": row["price"]
-        })
+        if row["item_name"]:
+            orders[order_indices[order_id]]["items"].append({
+                "item_name": row["item_name"],
+                "size": row["size"],
+                "quantity": row["quantity"],
+                "price_per_item": row["price"]
+            })
 
     return orders
 
-
 @app.get("/members/{member_id}/points")
 def get_member_points(member_id: str):
-    """Calculates points: 1 per whole dollar spent, rounded down [cite: 33, 34]"""
+    """
+    Calculates points: 1 per whole dollar, rounded down[cite: 34, 70].
+    Returns a breakdown of points earned per order[cite: 64].
+    """
     query = f"""
-        SELECT SUM(order_total) AS total_spent
+        SELECT order_id, order_date, order_total, CAST(FLOOR(order_total) AS INT64) as points_earned
         FROM `{PROJECT_ID}.{DATASET_ID}.orders`
         WHERE member_id = @member_id
+        ORDER BY order_date DESC
     """
     job_config = bigquery.QueryJobConfig(
         query_parameters=[bigquery.ScalarQueryParameter("member_id", "STRING", member_id)]
     )
-    results = run_query(query, job_config)
-    
-    total_spent = results[0]["total_spent"] or 0
-    points = int(total_spent) # Rounds down 
-    
+    history = run_query(query, job_config)
+   
+    total_points = sum(item['points_earned'] for item in history)
+   
     return {
-        "member_id": member_id, 
-        "loyalty_points": points,
-        "raw_spend": round(total_spent, 2)
+        "total_points": total_points,
+        "history": history
     }
 
 # -------------------------
-# MENU ENDPOINTS
+# MENU & ORDERING
 # -------------------------
 
-@app.get("/menu/grouped")
-def get_menu_grouped():
-    """
-    The 'Primary' endpoint. Use this to build the main menu 
-    because it provides the structure { "Category": [items...] } in one call.
-    """
-    # Fetch all items first
+@app.get("/menu")
+def get_menu():
+    """Browse menu by category or search [cite: 42, 44]"""
     query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.menu_items` ORDER BY category, name"
-    raw_items = run_query(query)
-    
-    # Organize them into a dictionary: { "CategoryName": [items...] }
-    grouped_menu = {}
-    for item in raw_items:
-        cat = item['category']
-        if cat not in grouped_menu:
-            grouped_menu[cat] = []
-        grouped_menu[cat].append(item)
-    
-    return grouped_menu
-
-
-@app.get("/menu/search/keyword")
-def search_menu_keyword(q: str):
-    # This searches both the name AND category for the keyword
-    query = f"""
-        SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.menu_items` 
-        WHERE LOWER(name) LIKE @q 
-           OR LOWER(category) LIKE @q
-        ORDER BY category, name
-    """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("q", "STRING", f"%{q.lower()}%")]
-    )
-    return run_query(query, job_config)
-
+    return run_query(query)
 
 @app.get("/menu/{item_id}")
 def get_menu_item(item_id: str):
-    query = f"""
-        SELECT *
-        FROM `{PROJECT_ID}.{DATASET_ID}.menu_items`
-        WHERE id = @item_id
-    """
+    """Detailed view for a single menu item [cite: 46]"""
+    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.menu_items` WHERE id = @item_id"
     job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("item_id", "STRING", item_id)
-        ]
+        query_parameters=[bigquery.ScalarQueryParameter("item_id", "STRING", item_id)]
     )
     results = run_query(query, job_config)
     if not results:
         raise HTTPException(status_code=404, detail="Item not found")
     return results[0]
 
+@app.post("/orders")
+def place_order(order: OrderCreate):
+    """Allows logged-in members to submit a new order (pay-at-store model) [cite: 48]"""
+    order_id = str(uuid.uuid4())
+    order_date = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
-# -------------------------
-# LOCATION ENDPOINTS
-# -------------------------
-
-@app.get("/locations/states")
-def get_location_states():
-    query = f"""
-        SELECT DISTINCT state
-        FROM `{PROJECT_ID}.{DATASET_ID}.locations`
-        WHERE open_for_business = TRUE
-        ORDER BY state
+    # 1. Insert order header
+    order_query = f"""
+        INSERT INTO `{PROJECT_ID}.{DATASET_ID}.orders` (order_id, member_id, store_id, order_date, order_total)
+        VALUES (@oid, @mid, @sid, @odate, @ototal)
     """
+   
+    # 2. Insert line items
+    # We build a bulk insert for the items
+    item_placeholders = []
+    item_params = [
+        bigquery.ScalarQueryParameter("oid", "STRING", order_id),
+        bigquery.ScalarQueryParameter("mid", "STRING", order.member_id),
+        bigquery.ScalarQueryParameter("sid", "STRING", order.store_id),
+        bigquery.ScalarQueryParameter("odate", "DATETIME", order_date),
+        bigquery.ScalarQueryParameter("ototal", "FLOAT", order.order_total),
+    ]
+
+    for i, item in enumerate(order.items):
+        item_placeholders.append(f"(@oid, @iid_{i}, @iname_{i}, @isize_{i}, @iqty_{i}, @iprice_{i})")
+        item_params.extend([
+            bigquery.ScalarQueryParameter(f"iid_{i}", "STRING", item.item_id),
+            bigquery.ScalarQueryParameter(f"iname_{i}", "STRING", item.item_name),
+            bigquery.ScalarQueryParameter(f"isize_{i}", "STRING", item.size),
+            bigquery.ScalarQueryParameter(f"iqty_{i}", "INT64", item.quantity),
+            bigquery.ScalarQueryParameter(f"iprice_{i}", "FLOAT", item.price),
+        ])
+
+    items_query = f"""
+        INSERT INTO `{PROJECT_ID}.{DATASET_ID}.order_items` (order_id, menu_item_id, item_name, size, quantity, price)
+        VALUES {", ".join(item_placeholders)}
+    """
+
+    full_script = f"{order_query}; {items_query}"
+   
+    try:
+        job_config = bigquery.QueryJobConfig(query_parameters=item_params)
+        client.query(full_script, job_config=job_config).result()
+        return {"status": "success", "order_id": order_id, "message": "Order submitted successfully!"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/orders/{order_id}/confirmation")
+def get_order_confirmation(order_id: str):
+    """Returns a summary for the order confirmation screen [cite: 49]"""
+    query = f"""
+        SELECT o.order_id, o.order_total, l.store_name, l.address_one, l.city
+        FROM `{PROJECT_ID}.{DATASET_ID}.orders` o
+        JOIN `{PROJECT_ID}.{DATASET_ID}.locations` l ON o.store_id = l.id
+        WHERE o.order_id = @oid
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("oid", "STRING", order_id)]
+    )
+    results = run_query(query, job_config)
+    if not results:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return results[0]
+
+# -------------------------
+# LOCATION ENHANCEMENTS
+# -------------------------
+
+@app.get("/locations")
+def get_locations():
+    """
+    Returns locations with amenities and map coordinates[cite: 52, 54].
+    Includes latitude and longitude for Map Integration[cite: 53].
+    """
+    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.locations` WHERE open_for_business = TRUE ORDER BY state, city"
     return run_query(query)
 
-
-@app.get("/locations/filter/state/{state}")
-def filter_locations_by_state(state: str):
-    """
-    Refined: Returns a clean list of stores in a state with 
-    clear amenity flags (WiFi, Drive-Thru, Delivery).
-    """
+@app.get("/locations/search")
+def search_locations(query_str: str):
+    """Filter or search locations by city or state [cite: 51]"""
     query = f"""
-        SELECT 
-            id, city, state, address_one, zip_code,
-            wifi, drive_thru, door_dash
-        FROM `{PROJECT_ID}.{DATASET_ID}.locations` 
-        WHERE UPPER(state) = UPPER(@state) 
-          AND open_for_business = TRUE
-        ORDER BY city
+        SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.locations`
+        WHERE (LOWER(city) LIKE @q OR LOWER(state) LIKE @q)
+        AND open_for_business = TRUE
     """
     job_config = bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("state", "STRING", state.upper())]
+        query_parameters=[bigquery.ScalarQueryParameter("q", "STRING", f"%{query_str.lower()}%")]
     )
-    results = run_query(query, job_config)
-    
-    # We map the results to clear labels for the frontend
-    return [
-        {
-            "id": loc["id"],
-            "city": loc["city"],
-            "address": f"{loc['address_one']}, {loc['city']}, {loc['state']} {loc['zip_code']}",
-            "services": {
-                "free_wifi": loc["wifi"],
-                "drive_thru": loc["drive_thru"],
-                "doordash_available": loc["door_dash"]
-            }
-        } for loc in results
-    ]
-
-
-@app.get("/locations/filter/city/{city}")
-def get_locations_by_city(city: str):
-    """
-    Refined: Now matches the 'State' filter format so the frontend 
-    can use the same code to display search results.
-    """
-    query = f"""
-        SELECT 
-            id, city, state, address_one, zip_code,
-            wifi, drive_thru, door_dash
-        FROM `{PROJECT_ID}.{DATASET_ID}.locations` 
-        WHERE LOWER(city) = LOWER(@city) 
-          AND open_for_business = TRUE
-        ORDER BY address_one
-    """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("city", "STRING", city.lower())]
-    )
-    results = run_query(query, job_config)
-    
-    if not results:
-        raise HTTPException(status_code=404, detail="No locations found for this city")
-
-    return [
-        {
-            "id": loc["id"],
-            "city": loc["city"],
-            "address": f"{loc['address_one']}, {loc['city']}, {loc['state']} {loc['zip_code']}",
-            "services": {
-                "free_wifi": loc["wifi"],
-                "drive_thru": loc["drive_thru"],
-                "doordash_available": loc["door_dash"]
-            }
-        } for loc in results
-    ]
-
-
-@app.get("/locations/{location_id}")
-def get_location_details(location_id: str):
-    """
-    Refined: Provides store identity, amenities, and human-readable 
-    hours. Excludes latitude/longitude.
-    """
-    query = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.locations` WHERE id = @id"
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("id", "STRING", location_id)]
-    )
-    results = run_query(query, job_config)
-    
-    if not results:
-        raise HTTPException(status_code=404, detail="Location not found")
-    
-    loc = results[0]
-    return {
-        "store_info": {
-            "name": f"Uncle Joe's Coffee - {loc['city']}",
-            "address": f"{loc['address_one']}, {loc['city']}, {loc['state']} {loc['zip_code']}",
-            "phone": loc['phone_number'],
-            "email": loc['email']
-        },
-        "amenities": {
-            "wifi_available": loc['wifi'],
-            "drive_thru_lane": loc['drive_thru'],
-            "doordash_partner": loc['door_dash']
-        },
-        "operating_hours": {
-            "Monday": f"{format_time(loc['hours_monday_open'])} - {format_time(loc['hours_monday_close'])}",
-            "Tuesday": f"{format_time(loc['hours_tuesday_open'])} - {format_time(loc['hours_tuesday_close'])}",
-            "Wednesday": f"{format_time(loc['hours_wednesday_open'])} - {format_time(loc['hours_wednesday_close'])}",
-            "Thursday": f"{format_time(loc['hours_thursday_open'])} - {format_time(loc['hours_thursday_close'])}",
-            "Friday": f"{format_time(loc['hours_friday_open'])} - {format_time(loc['hours_friday_close'])}",
-            "Saturday": f"{format_time(loc['hours_saturday_open'])} - {format_time(loc['hours_saturday_close'])}",
-            "Sunday": f"{format_time(loc['hours_sunday_open'])} - {format_time(loc['hours_sunday_close'])}"
-        }
-    }
-
+    return run_query(query, job_config)
 
 if __name__ == "__main__":
     import uvicorn
