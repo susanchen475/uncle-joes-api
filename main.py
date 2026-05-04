@@ -89,7 +89,8 @@ def login(body: LoginRequest):
         "member_id": row["id"],
         "name": f"{row['first_name']} {row['last_name']}",
         "email": row["email"],
-        "home_store_id": row["home_store_id"], # Supports home store highlight [cite: 63]
+        # FIX: Ensure it correctly uses row["home_store"], since the DB column is home_store
+        "home_store_id": row["home_store"],
         "token": "simple-session-token-123" # Persists logged-in state
     }
 
@@ -105,10 +106,11 @@ def logout():
 @app.get("/members/{member_id}/profile")
 def get_member_profile(member_id: str):
     """Returns profile info: name, email, phone, and home store [cite: 58, 62]"""
+    # FIX: Join on m.home_store instead of m.home_store_id
     query = f"""
         SELECT m.first_name, m.last_name, m.email, m.phone, l.store_name as home_store_name
         FROM `{PROJECT_ID}.{DATASET_ID}.members` m
-        LEFT JOIN `{PROJECT_ID}.{DATASET_ID}.locations` l ON m.home_store_id = l.id
+        LEFT JOIN `{PROJECT_ID}.{DATASET_ID}.locations` l ON m.home_store = l.id
         WHERE m.id = @id
     """
     job_config = bigquery.QueryJobConfig(
