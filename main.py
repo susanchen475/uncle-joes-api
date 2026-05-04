@@ -65,7 +65,7 @@ def login(body: LoginRequest):
     Pilot Password Requirement: Coffee123![cite: 10].
     """
     query = f"""
-        SELECT id, first_name, last_name, email, password, home_store_id
+        SELECT id, first_name, last_name, email, password, home_store
         FROM `{PROJECT_ID}.{DATASET_ID}.members`
         WHERE email = @email
         LIMIT 1
